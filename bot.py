@@ -1,12 +1,20 @@
 import os
 import logging
 import asyncio
+import tempfile
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 # Импортируем функции скачивания из yandexMusicDownloader.py
@@ -14,6 +22,14 @@ from yandexMusicDownloader import download_track, download_album, extract_track_
 
 # Импортируем класс для работы с базой данных
 from database import Database
+from backup_utils import (
+    export_backup,
+    cleanup_backup,
+    load_backup_file,
+    restore_users,
+    restore_downloads,
+    BackupError,
+)
 
 # Загружаем переменные окружения из файла .env
 load_dotenv()
@@ -26,6 +42,16 @@ YM_TOKEN = os.getenv("YM_TOKEN")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Получаем ID администратора из переменных окружения (если есть)
 ADMIN_ID = os.getenv("ADMIN_ID", "218957780")  # Используем указанный ID по умолчанию
+try:
+    ADMIN_ID_INT = int(ADMIN_ID) if ADMIN_ID else None
+except ValueError:
+    logging.warning("Переменная ADMIN_ID должна быть числом. Резервные копии будут отправляться инициатору команды.")
+    ADMIN_ID_INT = None
+
+DEFAULT_BACKUP_CRON = "0 9 * * MON"
+DEFAULT_BACKUP_TZ = "Europe/Moscow"
+BACKUP_CRON_EXPR = os.getenv("BACKUP_CRON", DEFAULT_BACKUP_CRON)
+BACKUP_TZ = os.getenv("BACKUP_TZ", DEFAULT_BACKUP_TZ)
 
 # Создаем экземпляр бота
 bot = Bot(token=BOT_TOKEN)
@@ -37,6 +63,198 @@ data_dir = os.path.join(os.path.dirname(__file__), 'data')
 os.makedirs(data_dir, exist_ok=True)
 
 db = Database(os.path.join(data_dir, 'bot_database.db'))
+
+TABLE_TITLES = {
+    "users": "Пользователи",
+    "downloads": "Скачивания",
+}
+
+
+def resolve_timezone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except Exception as exc:
+        logging.error("Некорректная временная зона '%s': %s. Используется UTC.", name, exc)
+        return ZoneInfo("UTC")
+
+
+def build_backup_trigger(tz: ZoneInfo) -> Tuple[CronTrigger, str]:
+    try:
+        cron = BACKUP_CRON_EXPR
+        return CronTrigger.from_crontab(cron, timezone=tz), cron
+    except ValueError as exc:
+        logging.error(
+            "Некорректное расписание BACKUP_CRON='%s': %s. Используется значение по умолчанию '%s'.",
+            BACKUP_CRON_EXPR,
+            exc,
+            DEFAULT_BACKUP_CRON,
+        )
+        return CronTrigger.from_crontab(DEFAULT_BACKUP_CRON, timezone=tz), DEFAULT_BACKUP_CRON
+
+
+@dataclass
+class RestoreSession:
+    chat_id: int
+    step: str
+    temp_dir: Path
+    prompt_message_id: Optional[int] = None
+    users_restored: Optional[int] = None
+    downloads_restored: Optional[int] = None
+    users_skipped: bool = False
+    downloads_skipped: bool = False
+
+
+restore_sessions: Dict[int, RestoreSession] = {}
+
+
+def resolve_backup_target(requester_id: int) -> int:
+    """Возвращает чат, куда следует отправить файлы бэкапа."""
+    return ADMIN_ID_INT or requester_id
+
+
+async def generate_and_send_backup(target_chat_id: int, caption_prefix: str) -> tuple[bool, Optional[str]]:
+    """Создает JSON-бэкап и отправляет его указанному пользователю."""
+    files = {}
+    try:
+        files = await asyncio.to_thread(export_backup, db)
+    except Exception as exc:
+        logging.error("Не удалось создать резервную копию: %s", exc)
+        return False, str(exc)
+
+    send_error: Optional[str] = None
+    try:
+        for table_key, meta in files.items():
+            caption = (
+                f"{caption_prefix}\n"
+                f"Таблица: {TABLE_TITLES.get(table_key, table_key)}\n"
+                f"Записей: {meta['count']}"
+            )
+            await bot.send_document(
+                chat_id=target_chat_id,
+                document=FSInputFile(str(meta["path"])),
+                caption=caption
+            )
+    except Exception as exc:
+        logging.error("Ошибка отправки резервной копии: %s", exc)
+        send_error = str(exc)
+    finally:
+        cleanup_backup(files)
+
+    if send_error:
+        return False, send_error
+    return True, None
+
+
+async def finalize_prompt(session: RestoreSession, text: str) -> None:
+    """Обновляет текст сообщения с шагом восстановления и убирает клавиатуру."""
+    if session.prompt_message_id is None:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=session.chat_id,
+            message_id=session.prompt_message_id,
+            text=text
+        )
+    except TelegramBadRequest:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id,
+                message_id=session.prompt_message_id,
+                reply_markup=None
+            )
+        except TelegramBadRequest:
+            pass
+    finally:
+        session.prompt_message_id = None
+
+
+async def prompt_current_step(user_id: int) -> None:
+    """Отправляет подсказку с запросом нужного JSON-файла."""
+    session = restore_sessions.get(user_id)
+    if not session:
+        return
+
+    if session.step == "users":
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Пропустить пользователей", callback_data="restore_skip_users")]]
+        )
+        text = (
+            "📁 Шаг 1 из 2.\n"
+            "Отправьте JSON-файл с резервной копией таблицы пользователей.\n"
+            "Если хотите оставить таблицу без изменений, нажмите «Пропустить пользователей»."
+        )
+    elif session.step == "downloads":
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Пропустить скачивания", callback_data="restore_skip_downloads")]]
+        )
+        text = (
+            "📁 Шаг 2 из 2.\n"
+            "Отправьте JSON-файл с резервной копией таблицы скачиваний.\n"
+            "Если хотите оставить таблицу без изменений, нажмите «Пропустить скачивания»."
+        )
+    else:
+        return
+
+    sent = await bot.send_message(
+        chat_id=session.chat_id,
+        text=text,
+        reply_markup=keyboard
+    )
+    session.prompt_message_id = sent.message_id
+
+
+def cleanup_restore_session(user_id: int) -> None:
+    """Удаляет временную директорию и завершает сессию восстановления."""
+    session = restore_sessions.pop(user_id, None)
+    if session and session.temp_dir.exists():
+        shutil.rmtree(session.temp_dir, ignore_errors=True)
+
+
+async def finish_restore(user_id: int) -> None:
+    """Отправляет итоговое сообщение по завершении восстановления."""
+    session = restore_sessions.get(user_id)
+    if not session:
+        return
+
+    summary_lines = ["🗃 Восстановление завершено:"]
+
+    if session.users_skipped:
+        summary_lines.append("• Пользователи: пропущено, данные не изменялись")
+    elif session.users_restored is not None:
+        summary_lines.append(f"• Пользователи: восстановлено {session.users_restored} записей")
+    else:
+        summary_lines.append("• Пользователи: изменений не внесено")
+
+    if session.downloads_skipped:
+        summary_lines.append("• Скачивания: пропущено, данные не изменялись")
+    elif session.downloads_restored is not None:
+        summary_lines.append(f"• Скачивания: восстановлено {session.downloads_restored} записей")
+    else:
+        summary_lines.append("• Скачивания: изменений не внесено")
+
+    await bot.send_message(
+        chat_id=session.chat_id,
+        text="\n".join(summary_lines)
+    )
+    cleanup_restore_session(user_id)
+
+
+async def scheduled_backup_job() -> None:
+    """Плановый еженедельный бэкап и отправка администратору."""
+    target_chat_id = ADMIN_ID_INT
+    if not target_chat_id:
+        logging.warning("ADMIN_ID не задан, пропускаю плановый бэкап.")
+        return
+
+    success, error = await generate_and_send_backup(
+        target_chat_id,
+        "📦 Плановый резервный бэкап"
+    )
+
+    if success:
+        logging.info("Плановый бэкап успешно отправлен администратору %s.", target_chat_id)
+    else:
+        logging.error("Не удалось отправить плановый бэкап: %s", error or "неизвестная ошибка")
 
 # ID или username канала для проверки подписки
 CHANNEL_USERNAME = "@DPAMAQUEEH1" # Замените на username вашего канала
@@ -135,6 +353,8 @@ async def cmd_help(message: Message):
             "<b>🔧 Команды администратора:</b>\n\n"
             "/help - Показать это сообщение\n"
             "/admin_stats - Показать общую статистику бота\n"
+            "/backup_now - Отправить резервную копию базы данных\n"
+            "/restore_backup - Восстановить базу данных из JSON-бэкапов\n"
             "/users - Показать количество пользователей\n"
             "/broadcast [текст] - Отправить сообщение всем пользователям\n"
             "/add_admin [id] - Добавить нового администратора\n\n"
@@ -335,6 +555,127 @@ async def process_music_link(message: Message):
         )
 
 # Добавляем команды администратора
+@dp.message(Command("backup_now"))
+async def cmd_backup_now(message: Message):
+    user_id = message.from_user.id
+
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    target_chat_id = resolve_backup_target(user_id)
+    status_message = await message.answer("⏳ Формирую резервную копию...")
+
+    success, error = await generate_and_send_backup(
+        target_chat_id,
+        "📦 Резервная копия (ручной запуск)"
+    )
+
+    try:
+        if success:
+            if target_chat_id == user_id:
+                await status_message.edit_text("✅ Бэкап отправлен вам в личные сообщения.")
+            else:
+                await status_message.edit_text("✅ Бэкап отправлен основному администратору.")
+        else:
+            await status_message.edit_text(f"❌ Не удалось создать бэкап: {error}")
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(Command("restore_backup"))
+async def cmd_restore_backup(message: Message):
+    user_id = message.from_user.id
+
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    if user_id in restore_sessions:
+        await message.answer("⚠️ Процесс восстановления уже запущен. Завершите его прежде чем начинать новый.")
+        return
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="ym_restore_"))
+    session = RestoreSession(
+        chat_id=message.chat.id,
+        step="users",
+        temp_dir=temp_dir,
+    )
+    restore_sessions[user_id] = session
+
+    status_message = await message.answer("⏳ Создаю резервную копию текущей базы и отправляю её вам...")
+
+    success, error = await generate_and_send_backup(
+        message.from_user.id,
+        "📦 Текущая база перед восстановлением"
+    )
+
+    if not success:
+        try:
+            await status_message.edit_text(f"❌ Не удалось создать резервную копию: {error}")
+        except TelegramBadRequest:
+            pass
+        cleanup_restore_session(user_id)
+        return
+
+    try:
+        await status_message.edit_text(
+            "📦 Резервная копия текущей базы отправлена вам в личные сообщения.\n"
+            "Теперь пришлите файлы для восстановления."
+        )
+    except TelegramBadRequest:
+        pass
+
+    await prompt_current_step(user_id)
+
+
+@dp.callback_query(F.data == "restore_skip_users")
+async def on_restore_skip_users(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    if not db.is_admin(user_id):
+        await callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    session = restore_sessions.get(user_id)
+    if not session or session.step != "users":
+        await callback_query.answer("Сейчас нечего пропускать.", show_alert=True)
+        return
+
+    session.users_skipped = True
+    session.users_restored = None
+
+    await finalize_prompt(session, "⏭️ Шаг 1: восстановление пользователей пропущено.")
+    await callback_query.answer("Шаг пропущен.")
+    await callback_query.message.answer("⏭️ Таблица пользователей оставлена без изменений.")
+
+    session.step = "downloads"
+    await prompt_current_step(user_id)
+
+
+@dp.callback_query(F.data == "restore_skip_downloads")
+async def on_restore_skip_downloads(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+
+    if not db.is_admin(user_id):
+        await callback_query.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    session = restore_sessions.get(user_id)
+    if not session or session.step != "downloads":
+        await callback_query.answer("Сейчас нечего пропускать.", show_alert=True)
+        return
+
+    session.downloads_skipped = True
+    session.downloads_restored = None
+
+    await finalize_prompt(session, "⏭️ Шаг 2: восстановление скачиваний пропущено.")
+    await callback_query.answer("Шаг пропущен.")
+    await callback_query.message.answer("⏭️ Таблица скачиваний оставлена без изменений.")
+
+    session.step = "done"
+    await finish_restore(user_id)
+
 
 # Команда для получения статистики (только для админов)
 @dp.message(Command("admin_stats"))
@@ -483,6 +824,56 @@ async def cmd_users(message: Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
+@dp.message(F.document)
+async def handle_backup_document(message: Message):
+    user_id = message.from_user.id
+    session = restore_sessions.get(user_id)
+
+    if not session or session.step not in {"users", "downloads"}:
+        return
+
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для восстановления базы данных.")
+        return
+
+    file_path = session.temp_dir / f"{session.step}.json"
+    processing_msg = await message.reply("⏳ Обрабатываю файл...")
+
+    try:
+        await message.document.download(destination=file_path)
+        rows = load_backup_file(file_path, session.step)
+
+        if session.step == "users":
+            restored = await asyncio.to_thread(restore_users, db, rows)
+            session.users_restored = restored
+            session.users_skipped = False
+            await finalize_prompt(session, f"✅ Шаг 1 завершён. Восстановлено пользователей: {restored}")
+            await processing_msg.edit_text(f"✅ Таблица пользователей восстановлена ({restored}).")
+            session.step = "downloads"
+            await prompt_current_step(user_id)
+        else:
+            restored = await asyncio.to_thread(restore_downloads, db, rows)
+            session.downloads_restored = restored
+            session.downloads_skipped = False
+            await finalize_prompt(session, f"✅ Шаг 2 завершён. Восстановлено скачиваний: {restored}")
+            await processing_msg.edit_text(f"✅ Таблица скачиваний восстановлена ({restored}).")
+            session.step = "done"
+            await finish_restore(user_id)
+    except BackupError as exc:
+        await processing_msg.edit_text(f"❌ Ошибка: {exc}")
+    except Exception as exc:
+        logging.error(f"Ошибка при восстановлении из резервной копии: {exc}")
+        await processing_msg.edit_text("❌ Произошла ошибка при восстановлении. Подробности в логах.")
+    finally:
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except OSError:
+            pass
+
+    return
+
+
 # Обработчик для всех остальных сообщений
 @dp.message()
 async def echo(message: Message):
@@ -502,8 +893,31 @@ async def echo(message: Message):
 
 # Функция запуска бота
 async def main():
-    # Запускаем бота
-    await dp.start_polling(bot)
+    backup_tz = resolve_timezone(BACKUP_TZ)
+    scheduler = AsyncIOScheduler(timezone=backup_tz)
+    trigger, cron_expr = build_backup_trigger(backup_tz)
+
+    scheduler.add_job(
+        scheduled_backup_job,
+        trigger=trigger,
+        id="weekly_backup",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.start()
+
+    tz_name = getattr(backup_tz, "key", str(backup_tz))
+    logging.info(
+        "Плановый бэкап активирован: BACKUP_CRON='%s', BACKUP_TZ='%s'.",
+        cron_expr,
+        tz_name,
+    )
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
 
 if __name__ == "__main__":
     import asyncio

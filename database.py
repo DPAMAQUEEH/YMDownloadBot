@@ -132,6 +132,146 @@ class Database:
             finally:
                 conn.close()
         return False
+
+    def export_users(self):
+        """Экспорт всех пользователей в список словарей"""
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT user_id, username, first_name, last_name, is_admin, registered_at, last_activity
+                    FROM users
+                    ORDER BY user_id
+                """)
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при экспорте пользователей: {e}")
+                return []
+            finally:
+                conn.close()
+        return []
+
+    def export_downloads(self):
+        """Экспорт всех скачиваний в список словарей"""
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, user_id, track_title, track_artist, download_time
+                    FROM downloads
+                    ORDER BY id
+                """)
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при экспорте скачиваний: {e}")
+                return []
+            finally:
+                conn.close()
+        return []
+
+    def clear_users(self):
+        """Удаление всех пользователей"""
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM users")
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при очистке таблицы пользователей: {e}")
+                return False
+            finally:
+                conn.close()
+        return False
+
+    def clear_downloads(self):
+        """Удаление всех скачиваний"""
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM downloads")
+                cursor.execute("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'downloads'")
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при очистке таблицы скачиваний: {e}")
+                return False
+            finally:
+                conn.close()
+        return False
+
+    def bulk_insert_users(self, records):
+        """Массовая вставка пользователей"""
+        if not records:
+            return 0
+
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.executemany(
+                    """
+                    INSERT INTO users (user_id, username, first_name, last_name, is_admin, registered_at, last_activity)
+                    VALUES (:user_id, :username, :first_name, :last_name, :is_admin, :registered_at, :last_activity)
+                    """,
+                    records
+                )
+                conn.commit()
+                return len(records)
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при массовой вставке пользователей: {e}")
+                return 0
+            finally:
+                conn.close()
+        return 0
+
+    def bulk_insert_downloads(self, records):
+        """Массовая вставка записей о скачиваниях"""
+        if not records:
+            return 0
+
+        conn = self.connect()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                all_with_id = all('id' in record for record in records)
+
+                if all_with_id:
+                    cursor.executemany(
+                        """
+                        INSERT INTO downloads (id, user_id, track_title, track_artist, download_time)
+                        VALUES (:id, :user_id, :track_title, :track_artist, :download_time)
+                        """,
+                        records
+                    )
+                    cursor.execute("SELECT MAX(id) FROM downloads")
+                    max_id = cursor.fetchone()[0]
+                    if max_id is not None:
+                        cursor.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'downloads'", (max_id,))
+                        if cursor.rowcount == 0:
+                            cursor.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('downloads', ?)", (max_id,))
+                else:
+                    cursor.executemany(
+                        """
+                        INSERT INTO downloads (user_id, track_title, track_artist, download_time)
+                        VALUES (:user_id, :track_title, :track_artist, :download_time)
+                        """,
+                        records
+                    )
+                conn.commit()
+                return len(records)
+            except sqlite3.Error as e:
+                logging.error(f"Ошибка при массовой вставке скачиваний: {e}")
+                return 0
+            finally:
+                conn.close()
+        return 0
     
     def get_all_users(self):
         """Получение списка всех пользователей"""
