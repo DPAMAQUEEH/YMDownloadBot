@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -11,6 +12,9 @@ from dotenv import load_dotenv
 # Импортируем функции скачивания из yandexMusicDownloader.py
 from yandexMusicDownloader import download_track, download_album, extract_track_info
 
+# Импортируем класс для работы с базой данных
+from database import Database
+
 # Загружаем переменные окружения из файла .env
 load_dotenv()
 
@@ -20,10 +24,19 @@ logging.basicConfig(level=logging.INFO)
 # Получаем токены из переменных окружения
 YM_TOKEN = os.getenv("YM_TOKEN")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Получаем ID администратора из переменных окружения (если есть)
+ADMIN_ID = os.getenv("ADMIN_ID", "218957780")  # Используем указанный ID по умолчанию
 
 # Создаем экземпляр бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Инициализируем базу данных
+# Создаем директорию data, если она не существует
+data_dir = os.path.join(os.path.dirname(__file__), 'data')
+os.makedirs(data_dir, exist_ok=True)
+
+db = Database(os.path.join(data_dir, 'bot_database.db'))
 
 # ID или username канала для проверки подписки
 CHANNEL_USERNAME = "@DPAMAQUEEH1" # Замените на username вашего канала
@@ -74,10 +87,27 @@ async def handle_check_subscription_callback(callback_query: types.CallbackQuery
     else:
         await callback_query.answer("Вы все еще не подписаны. Пожалуйста, подпишитесь и попробуйте снова.", show_alert=True)
 
+# Функция для регистрации пользователя в базе данных
+async def register_user(message: Message):
+    user = message.from_user
+    db.add_user(
+        user_id=user.id,
+        username=user.username or "",
+        first_name=user.first_name or "",
+        last_name=user.last_name or ""
+    )
+    # Если это первый запуск и указан ADMIN_ID, назначаем администратора
+    if ADMIN_ID and str(user.id) == ADMIN_ID and not db.is_admin(user.id):
+        db.set_admin(user.id, True)
+        logging.info(f"Пользователь {user.id} назначен администратором")
 
 # Обработчик команды /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    # Регистрируем пользователя
+    await register_user(message)
+    db.update_user_activity(message.from_user.id)
+    
     if not await check_subscription(message.from_user.id, CHANNEL_USERNAME):
         await send_subscription_message(message)
         return
@@ -92,16 +122,54 @@ async def cmd_start(message: Message):
 # Обработчик команды /help
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
+    # Обновляем активность пользователя
+    db.update_user_activity(message.from_user.id)
+    
     if not await check_subscription(message.from_user.id, CHANNEL_USERNAME):
         await send_subscription_message(message)
         return
+
+    # Если пользователь админ, показываем список админских команд
+    if db.is_admin(message.from_user.id):
+        await message.answer(
+            "<b>🔧 Команды администратора:</b>\n\n"
+            "/help - Показать это сообщение\n"
+            "/admin_stats - Показать общую статистику бота\n"
+            "/users - Показать количество пользователей\n"
+            "/broadcast [текст] - Отправить сообщение всем пользователям\n"
+            "/add_admin [id] - Добавить нового администратора\n\n"
+            "<b>📝 Обычные команды:</b>\n"
+            "/start - Начать работу с ботом\n"
+            "/stats - Показать вашу статистику скачиваний",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await message.answer(
+            "<b>🔍 Как пользоваться ботом:</b>\n\n"
+            "1. Найдите трек на Яндекс.Музыке\n"
+            "2. Скопируйте ссылку на трек\n"
+            "3. Отправьте ссылку мне\n"
+            "4. Дождитесь загрузки аудиофайла\n\n"
+            "<b>⚠️ Примечание:</b> Некоторые треки могут быть недоступны для скачивания из-за ограничений правообладателей.",
+            parse_mode=ParseMode.HTML
+        )
+
+# Добавляем команду /stats для пользователей
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    # Обновляем активность пользователя
+    db.update_user_activity(message.from_user.id)
+    
+    if not await check_subscription(message.from_user.id, CHANNEL_USERNAME):
+        await send_subscription_message(message)
+        return
+    
+    user_id = message.from_user.id
+    downloads_count = db.get_user_stats(user_id)
+    
     await message.answer(
-        "🔍 *Как пользоваться ботом:*\n\n"
-        "1. Найдите трек на Яндекс.Музыке\n"
-        "2. Скопируйте ссылку на трек\n"
-        "3. Отправьте ссылку мне\n"
-        "4. Дождитесь загрузки аудиофайла\n\n"
-        "⚠️ *Примечание:* Некоторые треки могут быть недоступны для скачивания из-за ограничений правообладателей.",
+        f"📊 *Ваша статистика*\n\n"
+        f"Скачано треков: {downloads_count}",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -112,6 +180,9 @@ def is_yandex_music_link(text: str) -> bool:
 # Обработчик ссылок на Яндекс.Музыку
 @dp.message(F.text.func(is_yandex_music_link))
 async def process_music_link(message: Message):
+    # Обновляем активность пользователя
+    db.update_user_activity(message.from_user.id)
+    
     if not await check_subscription(message.from_user.id, CHANNEL_USERNAME):
         await send_subscription_message(message)
         return
@@ -174,6 +245,9 @@ async def process_music_link(message: Message):
                             )
                             sent_count += 1
                             
+                            # Записываем информацию о скачивании в базу данных
+                            db.add_download(message.from_user.id, title, performer)
+                            
                             # Добавляем задержку между отправками, чтобы избежать блокировки за спам
                             # Задержка только если не последний трек
                             if i < total_tracks - 1:
@@ -232,6 +306,9 @@ async def process_music_link(message: Message):
                     performer=performer
                 )
                 
+                # Записываем информацию о скачивании в базу данных
+                db.add_download(message.from_user.id, title, performer)
+                
                 # Удаляем сообщение о загрузке
                 await processing_msg.delete()
                 
@@ -257,9 +334,163 @@ async def process_music_link(message: Message):
             "Пожалуйста, проверьте ссылку и попробуйте снова."
         )
 
+# Добавляем команды администратора
+
+# Команда для получения статистики (только для админов)
+@dp.message(Command("admin_stats"))
+async def cmd_admin_stats(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли пользователь администратором
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Получаем статистику
+    stats = db.get_total_stats()
+    
+    await message.answer(
+        f"📊 *Общая статистика бота*\n\n"
+        f"👥 Всего пользователей: {stats.get('total_users', 0)}\n"
+        f"🎵 Всего скачиваний: {stats.get('total_downloads', 0)}\n"
+        f"👤 Активных пользователей за неделю: {stats.get('active_users_week', 0)}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# Команда для отправки сообщения всем пользователям (только для админов)
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли пользователь администратором
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Получаем текст сообщения (после команды /broadcast)
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2:
+        await message.answer(
+            "⚠️ Пожалуйста, укажите текст сообщения после команды.\n"
+            "Пример: /broadcast Привет всем пользователям!"
+        )
+        return
+    
+    broadcast_text = command_parts[1]
+    
+    # Получаем список всех пользователей
+    users = db.get_all_users()
+    
+    if not users:
+        await message.answer("⚠️ В базе данных нет пользователей.")
+        return
+    
+    # Отправляем сообщение о начале рассылки
+    status_message = await message.answer(f"📤 Начинаю рассылку сообщения {len(users)} пользователям...")
+    
+    # Счетчики для статистики
+    sent_count = 0
+    error_count = 0
+    
+    # Отправляем сообщение каждому пользователю
+    for user in users:
+        try:
+            await bot.send_message(
+                chat_id=user['user_id'],
+                text=f"📢 *Сообщение от администратора*\n\n{broadcast_text}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            sent_count += 1
+            
+            # Обновляем статус каждые 10 отправленных сообщений
+            if sent_count % 10 == 0:
+                await status_message.edit_text(
+                    f"📤 Отправлено {sent_count}/{len(users)} сообщений..."
+                )
+            
+            # Добавляем небольшую задержку, чтобы избежать блокировки за спам
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения пользователю {user['user_id']}: {e}")
+            error_count += 1
+    
+    # Отправляем итоговую статистику
+    await status_message.edit_text(
+        f"✅ Рассылка завершена!\n\n"
+        f"📊 Статистика:\n"
+        f"✓ Успешно отправлено: {sent_count}\n"
+        f"❌ Ошибок: {error_count}"
+    )
+
+# Команда для добавления администратора (только для существующих админов)
+@dp.message(Command("add_admin"))
+async def cmd_add_admin(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли пользователь администратором
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Получаем ID нового администратора (после команды /add_admin)
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2:
+        await message.answer(
+            "⚠️ Пожалуйста, укажите ID пользователя после команды.\n"
+            "Пример: /add_admin 123456789"
+        )
+        return
+    
+    try:
+        new_admin_id = int(command_parts[1])
+    except ValueError:
+        await message.answer("⚠️ ID пользователя должен быть числом.")
+        return
+    
+    # Проверяем, существует ли пользователь в базе данных
+    user = db.get_user(new_admin_id)
+    if not user:
+        await message.answer(
+            "⚠️ Пользователь с указанным ID не найден в базе данных.\n"
+            "Пользователь должен хотя бы раз воспользоваться ботом."
+        )
+        return
+    
+    # Назначаем пользователя администратором
+    if db.set_admin(new_admin_id, True):
+        username = user['username'] or f"ID: {new_admin_id}"
+        await message.answer(f"✅ Пользователь {username} успешно назначен администратором.")
+    else:
+        await message.answer("❌ Произошла ошибка при назначении администратора.")
+
+# Команда для подсчета пользователей (только для админов)
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли пользователь администратором
+    if not db.is_admin(user_id):
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Получаем статистику
+    stats = db.get_total_stats()
+    
+    await message.answer(
+        f"👥 *Статистика пользователей*\n\n"
+        f"Всего пользователей: {stats.get('total_users', 0)}\n"
+        f"Активных за неделю: {stats.get('active_users_week', 0)}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 # Обработчик для всех остальных сообщений
 @dp.message()
 async def echo(message: Message):
+    # Регистрируем пользователя, если он новый
+    await register_user(message)
+    # Обновляем активность пользователя
+    db.update_user_activity(message.from_user.id)
+    
     if not await check_subscription(message.from_user.id, CHANNEL_USERNAME):
         await send_subscription_message(message)
         return

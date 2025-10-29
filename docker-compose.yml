@@ -6,4 +6,6 @@ services:
     container_name: YMDownloadBot
     env_file:
       - .env
-    restart: unless-stopped
+    restart: always
+    volumes:
+      - ./data:/app/data
